@@ -257,6 +257,9 @@ func (c *ConsistentHash) Remove(members ...string) {
 		for hash := range c.hashMap {
 			newRing = append(newRing, hash)
 		}
+		sort.Slice(newRing, func(i, j int) bool {
+			return newRing[i] < newRing[j]
+		})
 		c.ring = newRing
 	}
 }

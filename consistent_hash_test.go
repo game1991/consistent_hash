@@ -171,4 +171,25 @@ func Test_ConsistentHash(t *testing.T) {
 
 	// 验证被删除节点的数据是否都迁移到了顺时针方向的下一个节点
 	assert.NotContains(t, ch.Members(), nodeToRemove)
+
+	for oldNode, count := range beforeRemoveDistribution {
+		afterCount := afterRemoveDistribution[oldNode]
+		if afterCount != count {
+			t.Errorf("节点 %s 的数据迁移后数量不匹配：删除前 %d 个，删除后 %d 个", oldNode, count, afterCount)
+		}
+	}
+
+	// 验证数据迁移是否符合一致性哈希的特性
+	// 对于每个节点，检查其数据是否只迁移到了顺时针方向的下一个节点
+	for oldNode, targetNodes := range migrations {
+		if len(targetNodes) > 1 {
+			t.Errorf("节点 %s 的数据迁移到了多个节点: %v", oldNode, targetNodes)
+		}
+		// 检查是否只迁移到了新节点
+		for targetNode := range targetNodes {
+			if targetNode != newNode {
+				t.Errorf("数据从 %s 迁移到了错误的节点 %s，应该迁移到 %s", oldNode, targetNode, newNode)
+			}
+		}
+	}
 }
