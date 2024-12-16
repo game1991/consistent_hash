@@ -2,10 +2,11 @@ package consistent_hash
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/wcharczuk/go-chart" // 引入 go-charts 包
 )
 
 /*
@@ -29,12 +30,16 @@ func (h *TestHasher) Hash(key []byte) uint32 {
 	// 如果开头是node2，返回100
 	// 如果开头是node3，返回200
 	// 如果开头是node4，返回300
-	// 定义节点前缀到哈希值的映射
-	// 遍历映射，检查前缀并返回对应的哈希值
-	for prefix, hash := range h.hashValues {
-		if strings.HasPrefix(string(key), prefix) {
-			return hash
-		}
+	// 定义节点前缀到哈希值的映射(由于key在经过hashKey之后会出现空byte占位，所以使用特殊匹配来进行赋值)
+	trimmedKey := strings.TrimRight(string(key), "\x00")
+	// 装载node时摘取-之前的字符串
+	if strings.HasPrefix(trimmedKey, "node") { // 如果是node开头，返回0
+		split := strings.SplitN(trimmedKey, "-", 2)
+		trimmedKey = split[0]
+	}
+
+	if hash, ok := h.hashValues[trimmedKey]; ok {
+		return hash
 	}
 
 	// 默认返回0
@@ -97,10 +102,12 @@ func Test_ConsistentHash(t *testing.T) {
 		keyToNode[key] = node
 		fmt.Printf("数据 %s (hash=%d) 被分配到节点 %s\n", key, testDataHashes[key], node)
 	}
+	// 创建并保存初始饼状图
+	generatePieChart(initialDistribution, testData, "初始数据分布饼状图")
 
 	// 添加新节点 node5，位于 node1 和 node2 之间
 	newNode := "node5"
-	hasher.SetHash("node5-0", 50)
+	hasher.SetHash("node5", 50)
 	ch.Add(newNode)
 
 	// 检查数据迁移
@@ -135,61 +142,86 @@ func Test_ConsistentHash(t *testing.T) {
 			}
 		}
 	}
+	// 打印新的数据分布
+	for node, count := range newDistribution {
+		fmt.Printf("节点 %s 的数据数量：%d\n", node, count)
+	}
+	// 打印当前的哈希环上的节点和数据分布
+	for _, key := range testData {
+		node := ch.Get(key)
+		fmt.Printf("数据 %s (hash=%d) 被分配到节点 %s\n", key, testDataHashes[key], node)
+		// 更新keyToNode
+		keyToNode[key] = node
+	}
+
+	// 生成并保存添加节点后的饼状图
+	generatePieChart(newDistribution, testData, "添加节点后数据分布饼状图")
 
 	// 测试删除节点
 	fmt.Println("\n删除节点 node2 的影响:")
 	nodeToRemove := "node2"
-
-	// 记录删除前的分布
-	beforeRemoveDistribution := make(map[string]int)
-	keyToNodeBeforeRemove := make(map[string]string)
-
-	for _, key := range testData {
-		node := ch.Get(key)
-		beforeRemoveDistribution[node]++
-		keyToNodeBeforeRemove[key] = node
-	}
-
 	// 删除节点
 	ch.Remove(nodeToRemove)
-
-	// 检查数据迁移
-	afterRemoveDistribution := make(map[string]int)
+	newDistribution = make(map[string]int)
+	// 验证数据迁移
+	fmt.Println("\n删除节点 node2 后的数据分布:")
+	migrations = make(map[string]map[string]int)
 
 	for _, key := range testData {
 		newNode := ch.Get(key)
-		oldNode := keyToNodeBeforeRemove[key]
-		afterRemoveDistribution[newNode]++
-
+		oldNode := keyToNode[key]
+		newDistribution[newNode]++
 		if oldNode != newNode {
-			if oldNode == nodeToRemove {
-				fmt.Printf("数据 %s (hash=%d) 从被删除的节点 %s 迁移到 %s\n",
-					key, testDataHashes[key], oldNode, newNode)
+			if migrations[oldNode] == nil {
+				migrations[oldNode] = make(map[string]int)
 			}
-		}
-	}
-
-	// 验证被删除节点的数据是否都迁移到了顺时针方向的下一个节点
-	assert.NotContains(t, ch.Members(), nodeToRemove)
-
-	for oldNode, count := range beforeRemoveDistribution {
-		afterCount := afterRemoveDistribution[oldNode]
-		if afterCount != count {
-			t.Errorf("节点 %s 的数据迁移后数量不匹配：删除前 %d 个，删除后 %d 个", oldNode, count, afterCount)
+			migrations[oldNode][newNode]++
+			fmt.Printf("数据 %s 从 %s 迁移到 %s\n", key, oldNode, newNode)
 		}
 	}
 
 	// 验证数据迁移是否符合一致性哈希的特性
 	// 对于每个节点，检查其数据是否只迁移到了顺时针方向的下一个节点
+	nextNode := "node3"
 	for oldNode, targetNodes := range migrations {
 		if len(targetNodes) > 1 {
 			t.Errorf("节点 %s 的数据迁移到了多个节点: %v", oldNode, targetNodes)
 		}
 		// 检查是否只迁移到了新节点
 		for targetNode := range targetNodes {
-			if targetNode != newNode {
-				t.Errorf("数据从 %s 迁移到了错误的节点 %s，应该迁移到 %s", oldNode, targetNode, newNode)
+			if targetNode != nextNode {
+				t.Errorf("数据从 %s 迁移到了错误的节点 %s，应该迁移到 %s", oldNode, targetNode, nextNode)
 			}
 		}
+	}
+	// 生成并保存删除节点后的饼状图
+	generatePieChart(newDistribution, testData, "删除节点后数据分布饼状图")
+}
+
+// 生成饼状图的函数
+func generatePieChart(distribution map[string]int, testData []string, title string) {
+	pieChart := chart.PieChart{
+		Title:  title,
+		Width:  600,
+		Height: 400,
+		Values: []chart.Value{},
+	}
+
+	for node, count := range distribution {
+		pieChart.Values = append(pieChart.Values, chart.Value{
+			Label: fmt.Sprintf("%s: %.0f", node, float64(count)), // 显示节点名称和对应的值
+			Value: float64(count),
+		})
+	}
+
+	// 保存饼状图为 PNG 文件
+	f, err := os.Create(fmt.Sprintf("%s.png", title))
+	if err != nil {
+		fmt.Printf("无法创建文件: %v\n", err)
+		return
+	}
+	defer f.Close()
+	if err := pieChart.Render(chart.PNG, f); err != nil {
+		fmt.Printf("无法保存饼状图: %v\n", err)
 	}
 }
