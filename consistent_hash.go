@@ -100,7 +100,7 @@ func (c *ConsistentHash) hashKey(key string) uint32 {
 	if len(key) <= 64 {
 		var buf [64]byte
 		copy(buf[:], key)
-		fmt.Println("hashKey", key, "=", c.hash.Hash(buf[:]))
+		// fmt.Println("hashKey", key, "=", c.hash.Hash(buf[:]))
 		return c.hash.Hash(buf[:])
 	}
 	return c.hash.Hash([]byte(key))
@@ -110,42 +110,11 @@ func (c *ConsistentHash) formatKey(key string, replicas int) string {
 	return key + "-" + strconv.Itoa(replicas)
 }
 
-func (c *ConsistentHash) Add(members ...string) {
-	c.Lock()
-	defer c.Unlock()
-
-	for _, member := range members {
-		if _, ok := c.members[member]; ok || member == "" {
-			// 如果成员已经存在，或者成员为空，则跳过
-			continue
-		}
-		c.members[member] = struct{}{}    // 使用 map 存储成员
-		c.weights[member] = DefaultWeight // 使用默认权重
-		for i := 0; i < c.config.Replicas; i++ {
-			// 计算每个成员的虚拟节点（格式：成员名-序号）
-			hash := c.hashKey(c.formatKey(member, i))
-			c.ring = append(c.ring, hash)
-			c.hashMap[hash] = member
-		}
-	}
-	// 需要重新排序
-	sort.Slice(c.ring, func(i, j int) bool {
-		return c.ring[i] < c.ring[j]
-	})
-}
-
-// AddWithWeight 添加带权重的节点
-// weight参数指定节点的权重值，影响节点的虚拟节点数量：
-// - weight必须大于0
-// - 实际虚拟节点数 = 配置的基础虚拟节点数(Replicas) × weight
-// - 权重越大，节点在哈希环上的虚拟节点越多，负责的哈希环范围也就越大
-func (c *ConsistentHash) AddWithWeight(member string, weight int) error {
+// addNode adds a node to the hash ring with the specified weight
+func (c *ConsistentHash) addNode(member string, weight int) error {
 	if weight <= 0 {
 		return fmt.Errorf("weight must be positive")
 	}
-	c.Lock()
-	defer c.Unlock()
-
 	if _, ok := c.members[member]; ok || member == "" {
 		return fmt.Errorf("member already exists or empty")
 	}
@@ -153,43 +122,80 @@ func (c *ConsistentHash) AddWithWeight(member string, weight int) error {
 	c.members[member] = struct{}{}
 	c.weights[member] = weight
 
-	// 根据权重计算虚拟节点数
+	// Calculate virtual nodes based on weight
 	replicas := c.config.Replicas * weight
+	c.ensureRingCapacity(replicas)
 
-	// 预分配容量以提高性能
-	newSize := len(c.ring) + replicas
-	if cap(c.ring) < newSize {
-		newRing := make([]uint32, len(c.ring), newSize)
-		copy(newRing, c.ring)
-		c.ring = newRing
-	}
-
+	// Add virtual nodes
 	for i := 0; i < replicas; i++ {
 		hash := c.hashKey(c.formatKey(member, i))
 		c.ring = append(c.ring, hash)
 		c.hashMap[hash] = member
 	}
 
-	sort.Slice(c.ring, func(i, j int) bool {
-		return c.ring[i] < c.ring[j]
-	})
+	c.sortRing()
 	return nil
 }
 
-func (c *ConsistentHash) Get(key string) string {
-	c.RLock()
-	defer c.RUnlock()
-	if len(c.ring) == 0 {
-		return ""
+// ensureRingCapacity ensures the ring has enough capacity for new nodes
+func (c *ConsistentHash) ensureRingCapacity(additionalNodes int) {
+	newSize := len(c.ring) + additionalNodes
+	if cap(c.ring) < newSize {
+		newRing := make([]uint32, len(c.ring), newSize)
+		copy(newRing, c.ring)
+		c.ring = newRing
 	}
-	hash := c.hashKey(key)
+}
+
+// sortRing sorts the hash ring
+func (c *ConsistentHash) sortRing() {
+	sort.Slice(c.ring, func(i, j int) bool {
+		return c.ring[i] < c.ring[j]
+	})
+}
+
+func (c *ConsistentHash) Add(members ...string) {
+	c.Lock()
+	defer c.Unlock()
+
+	for _, member := range members {
+		_ = c.addNode(member, DefaultWeight)
+	}
+}
+
+// AddWithWeight 添加带权重的节点
+/*
+weight参数指定节点的权重值，影响节点的虚拟节点数量：
+	- weight必须大于0
+	- 实际虚拟节点数 = 配置的基础虚拟节点数(Replicas) × weight
+	- 权重越大，节点在哈希环上的虚拟节点越多，负责的哈希环范围也就越大
+*/
+func (c *ConsistentHash) AddWithWeight(member string, weight int) error {
+	c.Lock()
+	defer c.Unlock()
+	return c.addNode(member, weight)
+}
+
+// findNode finds the appropriate node for the given hash
+func (c *ConsistentHash) findNode(hash uint32) (int, string) {
 	idx := sort.Search(len(c.ring), func(i int) bool {
 		return c.ring[i] >= hash
 	})
 	if idx == len(c.ring) {
 		idx = 0
 	}
-	return c.hashMap[c.ring[idx]]
+	return idx, c.hashMap[c.ring[idx]]
+}
+
+func (c *ConsistentHash) Get(key string) string {
+	c.RLock()
+	defer c.RUnlock()
+
+	if len(c.ring) == 0 {
+		return ""
+	}
+	_, node := c.findNode(c.hashKey(key))
+	return node
 }
 
 func (c *ConsistentHash) GetN(key string, n int) []string {
@@ -204,16 +210,7 @@ func (c *ConsistentHash) GetN(key string, n int) []string {
 		return nil
 	}
 
-	hash := c.hashKey(key)
-	idx := sort.Search(len(c.ring), func(i int) bool {
-		return c.ring[i] >= hash
-	})
-
-	if idx == len(c.ring) {
-		idx = 0
-	}
-
-	// 使用map去重，因为可能有多个虚拟节点指向同一个实际节点
+	idx, _ := c.findNode(c.hashKey(key))
 	unique := make(map[string]struct{})
 	result := make([]string, 0, n)
 
@@ -294,36 +291,66 @@ func (c *ConsistentHash) GetStats() *Stats {
 	stats := &Stats{
 		TotalPhysicalNodes: len(c.members),
 		TotalHashNodes:     len(c.ring),
-		WeightDistribution: make(map[string]int),
 		LoadDistribution:   make(map[string]float64),
+		WeightDistribution: make(map[string]int),
 	}
+
+	// 计算权重分布
+	totalWeight := 0
+	stats.WeightDistribution = make(map[string]int)
+	for member := range c.members {
+		weight := c.weights[member] // 使用节点的实际权重
+		stats.WeightDistribution[member] = weight
+		totalWeight += weight
+	}
+	stats.AverageWeight = float64(totalWeight) / float64(len(c.members))
 
 	if len(c.ring) == 0 {
 		return stats
 	}
 
-	// 计算权重分布和平均权重
-	var totalWeight int
-	for member, weight := range c.weights {
-		stats.WeightDistribution[member] = weight
-		totalWeight += weight
-	}
-	if len(c.members) > 0 {
-		stats.AverageWeight = float64(totalWeight) / float64(len(c.members))
+	// 初始化每个成员的负载为0
+	for member := range c.members {
+		stats.LoadDistribution[member] = 0
 	}
 
-	// 计算每个member节点负责的哈希环范围
+	// 计算每个成员的负载分布
 	for i := 0; i < len(c.ring); i++ {
 		member := c.hashMap[c.ring[i]]
-		// 计算下一个节点的索引，如果是最后一个节点，则下一个是第一个节点（环形）
 		nextIdx := (i + 1) % len(c.ring)
-		// 计算当前节点到下一个节点的范围占比
-		// 如果next比当前值小，说明跨越了0点，需要补充整个环的长度
-		portion := float64(c.ring[nextIdx]-c.ring[i]) / float64(math.MaxUint32)
-		if c.ring[nextIdx] < c.ring[i] {
-			portion = float64(c.ring[nextIdx]+uint32(math.MaxUint32)-c.ring[i]) / float64(math.MaxUint32)
+
+		start := c.ring[i]
+		end := c.ring[nextIdx]
+
+		var portion uint32
+		if end > start {
+			portion = end - start
+		} else {
+			// 如果end小于start，说明跨过了0点
+			portion = math.MaxUint32 - start + end
 		}
-		stats.LoadDistribution[member] += portion
+
+		// 计算百分比
+		percentage := float64(portion) / float64(math.MaxUint32) * 100
+		// fmt.Printf("Debug - Range %d: member=%s, start=%d, end=%d, portion=%d, percentage=%.6f%%\n",
+		// 	i, member, start, end, portion, percentage)
+
+		stats.LoadDistribution[member] += percentage
+	}
+
+	// // 验证总和是否接近100%
+	// var total float64
+	// fmt.Println("\nDebug - Final Load Distribution:")
+	// for member, load := range stats.LoadDistribution {
+	// 	fmt.Printf("Member %s: %.6f%%\n", member, load)
+	// 	total += load
+	// }
+	// fmt.Printf("Debug - Total Load: %.6f%%\n", total)
+
+	// 四舍五入到四位小数
+	const precision = 10000 // 10^4 表示保留4位小数
+	for member := range stats.LoadDistribution {
+		stats.LoadDistribution[member] = math.Round(stats.LoadDistribution[member]*precision) / precision
 	}
 
 	return stats

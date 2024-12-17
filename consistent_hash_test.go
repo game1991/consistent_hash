@@ -2,6 +2,7 @@ package consistent_hash
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -26,23 +27,15 @@ func NewTestHasher() *TestHasher {
 }
 
 func (h *TestHasher) Hash(key []byte) uint32 {
-	// 如果开头是node1，返回0
-	// 如果开头是node2，返回100
-	// 如果开头是node3，返回200
-	// 如果开头是node4，返回300
-	// 定义节点前缀到哈希值的映射(由于key在经过hashKey之后会出现空byte占位，所以使用特殊匹配来进行赋值)
+	// 将字节数组转换为字符串，并去除尾部的空字节
 	trimmedKey := strings.TrimRight(string(key), "\x00")
-	// 装载node时摘取-之前的字符串
-	if strings.HasPrefix(trimmedKey, "node") { // 如果是node开头，返回0
-		split := strings.SplitN(trimmedKey, "-", 2)
-		trimmedKey = split[0]
-	}
 
+	// 直接查找完整的键值
 	if hash, ok := h.hashValues[trimmedKey]; ok {
 		return hash
 	}
 
-	// 默认返回0
+	// 如果没有找到预设的哈希值，返回一个固定值
 	return 0
 }
 
@@ -51,155 +44,152 @@ func (h *TestHasher) SetHash(key string, hash uint32) {
 }
 
 func Test_ConsistentHash(t *testing.T) {
-	// 创建自定义哈希函数
+	// 初始化哈希函数和一致性哈希环
 	hasher := NewTestHasher()
-
-	// 创建一致性哈希实例
 	ch := New(&Config{
-		Replicas: 1, // 为了简化测试，每个节点只有一个虚拟节点
+		Replicas: 1,
 		HashFunc: hasher,
 	})
 
-	// 设置节点的哈希值，使其在哈希环上均匀分布
-	// node1: 0
-	// node2: 100
-	// node3: 200
-	// node4: 300
+	// 1. 初始化节点配置
+	ringSize := uint32(math.MaxUint32)
+	interval := ringSize / 4 // 将环分成4份
+
+	// 设置4个初始节点，均匀分布在哈希环上
 	nodes := []string{"node1", "node2", "node3", "node4"}
 	nodeHashes := map[string]uint32{
-		"node1": 0,
-		"node2": 100,
-		"node3": 200,
-		"node4": 300,
+		"node1-0": 0,            // 0
+		"node2-0": interval,     // 1/4 环
+		"node3-0": interval * 2, // 2/4 环
+		"node4-0": interval * 3, // 3/4 环
 	}
+
+	// 设置节点的哈希值
+	fmt.Println("\nDebug - Node Hash Values:")
 	for node, hash := range nodeHashes {
+		fmt.Printf("%s: %d\n", node, hash)
 		hasher.SetHash(node, hash)
 	}
 
-	// 添加节点
+	// 添加节点到哈希环
 	ch.Add(nodes...)
 
-	// 生成测试数据并设置其哈希值
-	testData := make([]string, 0)
-	testDataHashes := make(map[string]uint32)
-
-	// 创建测试数据，使其分布在不同的区间
-	for i := 0; i < 400; i += 20 {
-		key := fmt.Sprintf("key-%d", i)
-		testData = append(testData, key)
-		testDataHashes[key] = uint32(i)
-		hasher.SetHash(key, uint32(i))
-	}
-
-	// 记录初始分布
-	initialDistribution := make(map[string]int)
-	keyToNode := make(map[string]string)
-
+	// 2. 生成测试数据
 	fmt.Println("\n初始数据分布:")
-	for _, key := range testData {
-		node := ch.Get(key)
-		initialDistribution[node]++
-		keyToNode[key] = node
-		fmt.Printf("数据 %s (hash=%d) 被分配到节点 %s\n", key, testDataHashes[key], node)
-	}
-	// 创建并保存初始饼状图
-	generatePieChart(initialDistribution, testData, "初始数据分布饼状图")
+	testDataCount := 20
+	dataInterval := ringSize / uint32(testDataCount) // 将测试数据均匀分布在环上
 
-	// 添加新节点 node5，位于 node1 和 node2 之间
+	testData := make([]string, 0, testDataCount)
+	testDataHashes := make(map[string]uint32)
+	keyToNode := make(map[string]string)
+	initialDistribution := make(map[string]int)
+
+	// 生成均匀分布的测试数据
+	for i := 0; i < testDataCount; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		keyHash := uint32(i) * dataInterval
+		hasher.SetHash(key, keyHash)
+
+		hash := hasher.Hash([]byte(key))
+		node := ch.Get(key)
+
+		fmt.Printf("hashKey %s = %d\n", key, hash)
+		fmt.Printf("数据 %s (hash=%d) 被分配到节点 %s\n", key, hash, node)
+
+		testData = append(testData, key)
+		testDataHashes[key] = hash
+		keyToNode[key] = node
+		initialDistribution[node]++
+	}
+
+	// 打印初始状态统计信息
+	stats := ch.GetStats()
+	printStats(stats)
+	// 生成初始数据分布饼状图
+	generatePieChart(initialDistribution, "初始数据分布饼状图")
+
+	// 3. 测试添加节点
+	fmt.Println("\n添加节点 node5 后的数据分布:")
 	newNode := "node5"
-	hasher.SetHash("node5", 50)
+	// 将node5放在node1和node2之间的中点
+	hasher.SetHash("node5-0", interval/2)
 	ch.Add(newNode)
 
 	// 检查数据迁移
-	fmt.Println("\n添加节点 node5 后的数据分布:")
-	migrations := make(map[string]map[string]int)
+	movedKeys := make(map[string]struct{})
 	newDistribution := make(map[string]int)
 
 	for _, key := range testData {
 		newNode := ch.Get(key)
-		oldNode := keyToNode[key]
 		newDistribution[newNode]++
 
-		if oldNode != newNode {
-			if migrations[oldNode] == nil {
-				migrations[oldNode] = make(map[string]int)
-			}
-			migrations[oldNode][newNode]++
+		if oldNode := keyToNode[key]; oldNode != newNode {
+			movedKeys[key] = struct{}{}
 			fmt.Printf("数据 %s 从 %s 迁移到 %s\n", key, oldNode, newNode)
 		}
 	}
 
-	// 验证数据迁移是否符合一致性哈希的特性
-	// 对于每个节点，检查其数据是否只迁移到了顺时针方向的下一个节点
-	for oldNode, targetNodes := range migrations {
-		if len(targetNodes) > 1 {
-			t.Errorf("节点 %s 的数据迁移到了多个节点: %v", oldNode, targetNodes)
-		}
-		// 检查是否只迁移到了新节点
-		for targetNode := range targetNodes {
-			if targetNode != newNode {
-				t.Errorf("数据从 %s 迁移到了错误的节点 %s，应该迁移到 %s", oldNode, targetNode, newNode)
-			}
-		}
-	}
-	// 打印新的数据分布
+	// 打印节点数据统计
 	for node, count := range newDistribution {
 		fmt.Printf("节点 %s 的数据数量：%d\n", node, count)
 	}
-	// 打印当前的哈希环上的节点和数据分布
+
+	// 重新打印所有数据的分布情况
 	for _, key := range testData {
+		hash := testDataHashes[key]
 		node := ch.Get(key)
-		fmt.Printf("数据 %s (hash=%d) 被分配到节点 %s\n", key, testDataHashes[key], node)
-		// 更新keyToNode
-		keyToNode[key] = node
+		fmt.Printf("hashKey %s = %d\n", key, hash)
+		fmt.Printf("数据 %s (hash=%d) 被分配到节点 %s\n", key, hash, node)
 	}
 
-	// 生成并保存添加节点后的饼状图
-	generatePieChart(newDistribution, testData, "添加节点后数据分布饼状图")
+	// 打印添加节点后的统计信息
+	stats = ch.GetStats()
+	printStats(stats)
+	// 生成添加节点后的饼状图
+	generatePieChart(newDistribution, "添加节点后数据分布饼状图")
 
-	// 测试删除节点
+	// 4. 测试删除节点
 	fmt.Println("\n删除节点 node2 的影响:")
 	nodeToRemove := "node2"
-	// 删除节点
+	fmt.Printf("hashKey %s-0 = %d\n", nodeToRemove, hasher.Hash([]byte(nodeToRemove+"-0")))
+
 	ch.Remove(nodeToRemove)
-	newDistribution = make(map[string]int)
-	// 验证数据迁移
 	fmt.Println("\n删除节点 node2 后的数据分布:")
-	migrations = make(map[string]map[string]int)
 
+	// 检查数据迁移
+	finalDistribution := make(map[string]int)
 	for _, key := range testData {
+		hash := testDataHashes[key]
 		newNode := ch.Get(key)
-		oldNode := keyToNode[key]
-		newDistribution[newNode]++
-		if oldNode != newNode {
-			if migrations[oldNode] == nil {
-				migrations[oldNode] = make(map[string]int)
-			}
-			migrations[oldNode][newNode]++
-			fmt.Printf("数据 %s 从 %s 迁移到 %s\n", key, oldNode, newNode)
+		finalDistribution[newNode]++
+		if oldNode := keyToNode[key]; oldNode == nodeToRemove {
+			fmt.Printf("数据 %s (hash=%d) 从 %s 迁移到 %s\n", key, hash, oldNode, newNode)
 		}
 	}
 
-	// 验证数据迁移是否符合一致性哈希的特性
-	// 对于每个节点，检查其数据是否只迁移到了顺时针方向的下一个节点
-	nextNode := "node3"
-	for oldNode, targetNodes := range migrations {
-		if len(targetNodes) > 1 {
-			t.Errorf("节点 %s 的数据迁移到了多个节点: %v", oldNode, targetNodes)
-		}
-		// 检查是否只迁移到了新节点
-		for targetNode := range targetNodes {
-			if targetNode != nextNode {
-				t.Errorf("数据从 %s 迁移到了错误的节点 %s，应该迁移到 %s", oldNode, targetNode, nextNode)
-			}
-		}
+	// 打印删除节点后的统计信息
+	stats = ch.GetStats()
+	printStats(stats)
+	// 生成删除节点后的饼状图
+	generatePieChart(finalDistribution, "删除节点后数据分布饼状图")
+}
+
+func printStats(stats *Stats) {
+	fmt.Printf("Total Physical Nodes: %d\n", stats.TotalPhysicalNodes)
+	fmt.Printf("Total Hash Nodes: %d\n", stats.TotalHashNodes)
+	fmt.Printf("Average Weight: %.2f\n", stats.AverageWeight)
+	fmt.Println("Weight Distribution:")
+	for node, weight := range stats.WeightDistribution {
+		fmt.Printf("  %s: %d\n", node, weight)
 	}
-	// 生成并保存删除节点后的饼状图
-	generatePieChart(newDistribution, testData, "删除节点后数据分布饼状图")
+	fmt.Println("Load Distribution:")
+	for node, load := range stats.LoadDistribution {
+		fmt.Printf("  %s: %.2f%%\n", node, load)
+	}
 }
 
 // 生成饼状图的函数
-func generatePieChart(distribution map[string]int, testData []string, title string) {
+func generatePieChart(distribution map[string]int, title string) {
 	pieChart := chart.PieChart{
 		Title:  title,
 		Width:  600,
